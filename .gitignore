@@ -31,3 +31,6 @@
 # Debug files
 *.dSYM/
 *.su
+
+# CLion configuration folder
+.idea

@@ -1,7 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include <pthread.h>
+#include <mpi.h>
+#include <omp.h>
+#include <memory.h>
 
 #define NUM_THREADS 4
 
@@ -50,9 +52,10 @@ int2 coordinatesConversion(double x,double y, int nColumns,int nLines) {
     return ret;
 }
 
-int printMatrixToFilePGM(float **mat,int tamx, int nLines, char *srcFile) {
+int printMatrixToFilePGM(float **mat, int tamx, int nLines, char *srcFile) {
+    
     FILE *arq=fopen(srcFile,"w");
-
+    
     int cont, cont2;
     float min,max;
     min=mat[0][0];
@@ -84,16 +87,25 @@ int printMatrixToFilePGM(float **mat,int tamx, int nLines, char *srcFile) {
 float** mallocFloatMatrix(int tamx, int nLines, float defaultValueOfTheElementsAtMatrix) {
     float **errorCodeReturn=0x0;
     float **mat;
-    int i,j;
-    int condErrorMalloc=0;//error indicator at malloc
+    float *data;
+    int i, j;
+    int condErrorMalloc=0; // error indicator at malloc
+    
+    // Contiguous multiarray
+    data = malloc(sizeof (float) * tamx * nLines);
     mat=malloc(sizeof(float *)*nLines);
-    if(mat==0x0) return errorCodeReturn;//error at malloc return null pointer
-    for(i=0;i<tamx;i++)
-        mat[i]=malloc(sizeof(float )*tamx);
+    if(mat==0x0) {
+        printf("mallocFloatMatrix: malloc error: mat==0x0");
+        return errorCodeReturn; // error at malloc return null pointer
+    }
+    for (i=0; i<nLines; i++) {
+        mat[i] = &(data[tamx*i]);
+    }
 
 
-    for(i=0;i<tamx;i++){//detect error at malloc
-        if(mat[i]==0x0){
+    for (i=0; i<nLines; i++) { // detect error at malloc
+        if (mat[i]==0x0) {
+            printf("mallocFloatMatrix: malloc error: mat[%i]==0x0", i);
             condErrorMalloc=1;
             break;
         }
@@ -106,20 +118,12 @@ float** mallocFloatMatrix(int tamx, int nLines, float defaultValueOfTheElementsA
         for(j=0;j<tamx;j++)
             mat[i][j]=defaultValueOfTheElementsAtMatrix;
     }
-    for(i=0;i<tamx;i++)
+    for(i=0;i<nLines;i++)
         if(mat[i]!=0x0) free(mat[i]);
 
     free(mat);
 
     return errorCodeReturn;
-}
-
-void freeFloatMatrix(float **mat,int tamx, int nLines) {
-    int i;
-    for(i=0;i<nLines;i++){
-        if(mat[i]!=0x0) free(mat[i]);
-    }
-    free(mat);
 }
 
 int iteration(double x,double y, int nColumns,int nLines, int ite,int2 *iterationPath) {
@@ -152,87 +156,88 @@ int iteration(double x,double y, int nColumns,int nLines, int ite,int2 *iteratio
     return cont;
 }
 
-void *worker(void *p) {
-    int k;
-    double x,y;
+int main(int argc, char *argv[]) {
+    //image size=========================================================
+    int nColumns = 4096;
+    int nLines = 4096;
+    //end================================================================
+    //size points========================================================
+    double dt = 0.00025; // quantity of points going to increase with the decrease of the dt value
+    int size = (int) round(4.0 / dt); // sizeOfPoints = size*size
+    //end================================================================
+    int ite = 600;
+    
+    float **mat = mallocFloatMatrix(nColumns, nLines, 0.0f);
+    if (mat == 0x0) {
+        return 0;
+    }
+    
+    int i, j, k;
+    double x, y;
+    int progress=0;
 
-    while (1) {
-        //shared iterator update=========================================
-        pthread_mutex_lock(((args*)p)->i_mutex);
-        ++*(((args*)p)->i);
-        if(*(((args*)p)->i) >= ((args*)p)->size) {
-            pthread_mutex_unlock(((args*)p)->i_mutex);
-            break;
-        }
-        pthread_mutex_unlock(((args*)p)->i_mutex);
-        //end============================================================
+    int numprocs, rank;
+    
+    MPI_Init(&argc, &argv);
+    MPI_Comm_size(MPI_COMM_WORLD, &numprocs);
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
-        x=-2.0+((double)(*(((args*)p)->i))*(((args*)p)->dt));
-        for(y=-2.0;y<2.0;y=y+(((args*)p)->dt)){//imaginary component of C at $z_{n+1}=z_n+C$
-            int2* iterationPath=(int2 *)malloc(sizeof(int2)*(((args*)p)->ite));
-            if(iterationPath==0x0) return NULL;
-            int completedIterations =iteration(x,y,((args*)p)->nColumns,((args*)p)->nLines,((args*)p)->ite, iterationPath);//completedIterations= quantity of elements at vector iterationPath
-            for(k=0;k<completedIterations;k++){
-                if(iterationPath[k].x!=-1 && iterationPath[k].y!=-1)//test if a point z in the iteration k may be normalized to coordinates at matrix mat. 
-                    (((args*)p)->mat)[iterationPath[k].x][iterationPath[k].y]=(((args*)p)->mat)[iterationPath[k].x][iterationPath[k].y]+1.0f;//increments a point in matrix, this point is pointed by z with  z points normalized.
+    int start = rank * (size/numprocs + (size%numprocs-rank > 0 ? 1 : 0));
+    int end = (rank+1) * (size/numprocs + (size%numprocs-(rank+1) > 0 ? 1 : 0));
+
+    omp_set_num_threads(5);
+    
+    #pragma omp parallel for private(k, x, y)
+    for (i=start; i<end; i++) { // real component of C at $z_{n+1}=z_n+C$
+        
+        x = -2.0 + i*dt;
+        for (y=-2.0; y<2.0; y=y+dt) { // imaginary component of C at $z_{n+1}=z_n+C$
+
+            int2* iterationPath = (int2 *) malloc(sizeof(int2)*ite);
+            if (iterationPath==0x0) {
+                //return 0x0;
+                i=end;
+            }
+
+            // completedIterations = quantity of elements at vector iterationPath
+            int completedIterations = iteration(x, y, nColumns, nLines, ite, iterationPath);
+            for (k=0; k<completedIterations; k++) {
+                if (iterationPath[k].x!=-1 && iterationPath[k].y!=-1) { // test if a point z in the iteration k may be normalized to coordinates at matrix mat.
+                    mat[iterationPath[k].x][iterationPath[k].y] = mat[iterationPath[k].x][iterationPath[k].y] + 1.0f; // increments a point in matrix, this point is pointed by z with  z points normalized.
+                }
             }
             free(iterationPath);
         }
 
-        pthread_mutex_lock(((args*)p)->progress_mutex);
-        ++*(((args*)p)->progress);
-
-        if (*(((args*)p)->progress)%100 == 0) {//print at screen information about progrees of the operation
-            printf("%lf \n",x);
+        progress++;
+        if (progress%100 == 0) { // print at screen information about progress of the operation
+            printf("%lf \n", x);
         }
-        pthread_mutex_unlock(((args*)p)->progress_mutex);
     }
     
-    return NULL;
-}
-
-int main(void) {
-    //threads============================================================
-    pthread_t threads[NUM_THREADS];
-    //image size=========================================================
-    int nColumns=2048;
-    int nLines=2048;
-    //end================================================================
-    //size points========================================================
-    double dt=0.001;//quantity of points going to increase with the  decrease  of the dt value
-    int size= (int) round(4.0 / dt);//sizeOfPoints=size*size
-    //end================================================================
-    int ite=600;
-
-    float **mat=mallocFloatMatrix(nColumns,nLines,0.0f);
-    if(mat==0x0) return 0;
-    int t,i=0;
-    int progress=0;
-    pthread_mutex_t i_mutex = PTHREAD_MUTEX_INITIALIZER;
-    pthread_mutex_t progress_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-    args a = {
-            .i = &i,
-            .progress = &progress,
-            .mat = mat,
-            .dt = dt,
-            .size = size,
-            .ite = ite,
-            .nColumns = nColumns,
-            .nLines = nLines,
-            .i_mutex = &i_mutex,
-            .progress_mutex = &progress_mutex
-    };
-
-    for(t=0; t<NUM_THREADS; t++) {
-        pthread_create(&threads[t], NULL, worker, &a);
+    if (rank!=0) {
+        MPI_Send(&(mat[0][0]), nColumns * nLines, MPI_FLOAT, 0, 1, MPI_COMM_WORLD);
+    } else {
+        float **aux;
+        for (i=1; i<numprocs; i++) {
+            aux = mallocFloatMatrix(nColumns, nLines, 0.0f);
+            MPI_Status status;
+            MPI_Recv(&(aux[0][0]), nColumns * nLines, MPI_FLOAT, MPI_ANY_SOURCE, 1, MPI_COMM_WORLD, &status);
+            for (j = 0; j < nLines; j++) {
+                for (k = 0; k < nColumns; k++) {
+                    mat[j][k] += aux[j][k];
+                }
+            }
+            free(aux[0]);
+            free(aux);
+        }
+        
+        printMatrixToFilePGM(mat, nColumns, nLines, "output.pgm");
     }
-
-    for(t=0; t<NUM_THREADS; t++) {
-        pthread_join(threads[t], NULL);
-    }
-
-    printMatrixToFilePGM(mat,nColumns,nLines,"saida3.pgm");
-    freeFloatMatrix(mat,nColumns,nLines);
+    
+    MPI_Barrier(MPI_COMM_WORLD);
+    free(mat[0]);
+    free(mat);
+    
     return 0;
 }
